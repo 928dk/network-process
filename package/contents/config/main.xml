@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+    <kcfgfile name=""/>
+
+    <group name="General">
+        <entry name="refreshInterval" type="Int">
+            <default>1000</default>
+            <label>Polling interval in milliseconds (500-5000)</label>
+            <min>500</min>
+            <max>5000</max>
+        </entry>
+        <entry name="monitorInterface" type="String">
+            <default></default>
+            <label>Network interface to monitor (empty = all)</label>
+        </entry>
+    </group>
+</kcfg>

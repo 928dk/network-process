@@ -1,0 +1,24 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "",
+                "Name": "the author"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Per-process network bandwidth monitor (wraps nethogs)",
+        "Description[da]": "Netværksbåndbredde-overvågning pr. proces (indpakker nethogs)",
+        "EnabledByDefault": true,
+        "Icon": "network-transmit-receive",
+        "Id": "network-perprocess-monitor",
+        "License": "GPL-3.0-only",
+        "Name": "Per-Process Network Monitor",
+        "Name[da]": "Netværksmonitor pr. proces",
+        "Version": "0.1.0",
+        "Website": ""
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "FormFactors": ["desktop", "panel"],
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

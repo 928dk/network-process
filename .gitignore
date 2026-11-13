@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*.log
+.env
+.venv/
+venv/
+node_modules/
+.DS_Store
+.split-extra-ignore
+
+# Editor and experiment residue: never tracked again
+*.bak
+*.bak[0-9]*
+*.old
+network-process-log.py
+
+# Agent and generated-analysis files stay local
+Agents.md
+AGENTS.md
+Agents.md.*
+AGENTS.md.*
+project_analysis_*.json
+quick-project-analysis-*.md
+
+# --- added by publish-sanitize ---
+venv/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+data/
+archives/

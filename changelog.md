@@ -1,6 +1,29 @@
 # Changelog
 
+## 0.5.0 — 2026-11-17
+- Add **Usage over time**: a day's sent and received traffic drawn from minute samples, with
+  1 h / 3 h / whole-day ranges, an optional process filter and 1 / 5 / 15 / 60-minute granularity.
+  Missing minutes are zero rather than interpolated; a day with no minute detail shows its day
+  total and the date detail starts from
+- Add **Connections / peers**: every stored socket with its peer, cached name, port, protocol,
+  state, local endpoint, owning process, pid, user and last-seen time. The tab is explicitly
+  **connection activity, not traffic** — bytes are recorded per process per day and are not
+  attributed to peers, and no column is a byte count
+- Add `Only running processes` to hide sockets of exited instances, and `Resolve names` to fetch
+  peer names on request through the existing resolver and cache; opening the tab never resolves
+- Upgrade the database to schema version 3 with additive migration and a `.bak-<stamp>` copy:
+  `traffic_samples` records one row per day, minute and process name from the accounting path that
+  already writes `daily_totals`, so both agree. Minute rows are pruned after 30 days and older
+  days keep their day totals
+- Fix a multi-second GUI freeze on a return visit to **Connections / peers**: every column now has
+  a fixed, draggable width. `ResizeToContents` rescanned every row for each `setItem` on a table
+  rebuilt in place, which grew quadratically with the socket count; the other timer-rebuilt
+  tables use fixed widths for the same reason
+
 ## 0.4.0 — 2026-11-13
+- Make both day totals agree: one `_day_totals(day)` helper feeds the `Today` line and the line
+  under `History month:`, both render on every tick, and only the two tables behind them are
+  throttled to 2 s. A selection that pointed at the newest day follows the midnight rollover
 - Build the **Settings** dialog that persists to `QSettings`: which summary lines show, rate and
   total units, colour scheme, interface, reverse DNS, and interface language
 - Add display units — binary (KiB/MiB), decimal (kB/MB) and bits (kbit/Mbit) — without changing
@@ -13,6 +36,13 @@
 - Capture all sockets from a single `ss -tunap` call and parse them into structured records
   (zones, bracketed IPv6 and wildcard listeners included) instead of matching text per PID
 - Upgrade the database to schema version 2, additively and with the same `.bak-<stamp>` backup
+- Track the capture devices: re-read the device set every 5 s and restart `nethogs` when it
+  changes, so a VPN tunnel that appears after Start is captured instead of silently reading zero
+- Fold nethogs' unattributable PID-0 rows (`unknown TCP`, bare `src:dst` pairs) into one
+  `(unattributed)` process instead of storing them as processes that never existed
+- Wrap every user-visible string in `tr()` and add the language plumbing: Danish and German
+  catalogues committed untranslated, `build-translations.sh` (pylupdate6 + lrelease6), and a
+  Language tab that lists only locales with a compiled `.qm`
 
 ## 0.3.0 — 2026-11-10
 - Log every observed process run to a new `process_instances` table: command line, user, parent command, start time, first/last seen

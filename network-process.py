@@ -29,8 +29,11 @@ from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import (
+    QCoreApplication,
     QObject,
+    QPointF,
     QProcess,
+    QRectF,
     QRunnable,
     QSettings,
     QStandardPaths,
@@ -40,7 +43,16 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QFontDatabase, QKeySequence, QPainter, QPalette, QPen
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFontDatabase,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -145,7 +157,7 @@ def missing_nethogs_capabilities(path: str) -> list[str]:
     return [name for name, bit in NETHOGS_CAPABILITIES if not permitted >> bit & 1]
 
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 # Units. The module-level defaults are set from the persisted settings once at
 # startup (and again whenever the dialog changes them), so every existing call
@@ -158,14 +170,25 @@ TOTAL_UNIT_MODES = ("binary", "decimal")
 # The six information lines in the main window. Hiding one is presentation
 # only: the refresh path still computes and stores every number.
 SUMMARY_LINES = ("status", "total", "tx", "rx", "today", "history")
-SUMMARY_LINE_LABELS = {
-    "status": "Status line",
-    "total": "Total rate",
-    "tx": "Total TX rate",
-    "rx": "Total RX rate",
-    "today": "Today's totals",
-    "history": "Selected day total (under History month)",
-}
+
+
+def summary_line_labels() -> dict[str, str]:
+    """Translatable labels for the six summary lines.
+
+    A function rather than a constant: the labels must follow a language change
+    made in the settings dialog, and ``pylupdate6`` still finds every source
+    string because they are written out in full.
+    """
+    return {
+        "status": QCoreApplication.translate("SummaryLine", "Status line"),
+        "total": QCoreApplication.translate("SummaryLine", "Total rate"),
+        "tx": QCoreApplication.translate("SummaryLine", "Total TX rate"),
+        "rx": QCoreApplication.translate("SummaryLine", "Total RX rate"),
+        "today": QCoreApplication.translate("SummaryLine", "Today's totals"),
+        "history": QCoreApplication.translate(
+            "SummaryLine", "Selected day total (under History month)"
+        ),
+    }
 
 COLOR_SCHEMES = ("system", "dark", "light", "contrast")
 
@@ -434,7 +457,7 @@ PS_FIELD_NAMES = ("pid", "ppid", "user", "elapsed", "state", "args")
 MAX_ANCESTORS = 5
 ANCESTOR_ARGS_LIMIT = 200
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INSTANCE_FIELDS = (
     "pid",
     "started_at",
@@ -456,12 +479,69 @@ MAX_DNS_WORKERS = 4
 NEGATIVE_DNS_TTL_SECONDS = 300
 DNS_HOSTNAME_LIMIT = 60
 DNS_CACHE_RETENTION_DAYS = 7
-DNS_DISABLED_HINT = "DNS resolution is off. Turn it on under Settings > Network."
+def dns_disabled_hint() -> str:
+    """The line a details report carries while reverse DNS is switched off."""
+    return QCoreApplication.translate(
+        "ProcessReport", "DNS resolution is off. Turn it on under Settings > Network."
+    )
 
 # The selected day's view (totals line, name totals, instance history) is
 # rebuilt on this cadence. The live table keeps its one-second refresh; this
 # only governs the history panes, which change slowly and cost a table rebuild.
 DAY_VIEW_REFRESH_SECONDS = 2.0
+
+# The usage graph reads an aggregate over the visible window, so it is refreshed
+# on a slow cadence and only while its tab is the visible one. The one-second
+# tick must not pay for a query whose answer changes at most once a minute, and
+# a hidden tab must issue no query at all.
+USAGE_REFRESH_SECONDS = 60
+USAGE_RANGE_HOURS = (1, 3, 6)
+USAGE_GRANULARITIES = (1, 5, 15, 60)
+MINUTES_PER_DAY = 1440
+
+# Column order of one peers-tab row, in the order `_peers_query` selects them.
+PEER_FIELDS = (
+    "peer_address",
+    "peer_port",
+    "netid",
+    "state",
+    "local_address",
+    "local_port",
+    "hostname",
+    "process_name",
+    "pid",
+    "user_name",
+    "started_at",
+    "last_seen",
+    "captured_at",
+)
+
+# Resolver answers arrive one signal per address. A burst of them would rebuild
+# the peers table once per answer, so the rebuild waits for the burst to quiet.
+PEER_NAME_REFRESH_MS = 400
+
+# nethogs binds its capture handles once, when it starts. A device created
+# afterwards (a VPN tunnel that comes up a minute later) is never seen, and
+# every byte inside it is invisible: the processes look idle and nothing in the
+# log says why. The monitor therefore watches the capture set and restarts the
+# child when it changes.
+INTERFACE_SCAN_SECONDS = 5
+
+# nethogs cannot always map a flow to a process. It reports those as "unknown
+# TCP" or as a bare "address:port-address:port" pair, both with pid 0. Storing
+# them under their raw names invented processes that never existed, so they are
+# accumulated into one labelled row instead.
+UNATTRIBUTED_PROCESS = "(unattributed)"
+
+# Minute-resolution samples. `daily_totals` and `process_usage` are per-day
+# aggregates with no intra-day column, and the live chart keeps its points in a
+# deque that dies with the window, so nothing on disk could draw a day.
+# A sample is a slice of the same interval the day total is computed from, taken
+# in `_record_interval` rather than by a second sampler, so the two cannot drift.
+# The buffer is flushed at most once a minute: a write in the one-second path
+# would buy resolution the tick does not have.
+SAMPLE_RETENTION_DAYS = 30
+SAMPLE_FLUSH_SECONDS = 60
 
 try:
     SC_CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -618,6 +698,41 @@ def read_process_sockets(pid: int) -> list[SocketState]:
     return read_socket_table().get(pid, [])
 
 
+def capture_interfaces(root: str = "/sys/class/net") -> tuple[tuple[str, int], ...]:
+    """Return the (name, ifindex) pairs nethogs would bind to if started now.
+
+    ``ifindex`` is part of the identity on purpose: a VPN interface that is torn
+    down and recreated keeps its name but gets a new index, and the old capture
+    handle is dead even though the name still matches.
+
+    Loopback, bridges and veth peers are left out. They carry container and VM
+    traffic that the uplink shows as well, and they appear and disappear with
+    every container, so watching them would restart the capture constantly.
+    """
+    devices: list[tuple[str, int]] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return ()
+    for entry in entries:
+        name = entry.name
+        if name == "lo":
+            continue
+        base = os.path.join(root, name)
+        if os.path.exists(os.path.join(base, "bridge")):
+            continue
+        try:
+            ifindex = int(Path(base, "ifindex").read_text(encoding="ascii").strip())
+            iflink = int(Path(base, "iflink").read_text(encoding="ascii").strip())
+            state = Path(base, "operstate").read_text(encoding="ascii").strip()
+        except (OSError, ValueError):
+            continue
+        if iflink != ifindex or state == "down":
+            continue
+        devices.append((name, ifindex))
+    return tuple(sorted(devices))
+
+
 def _short_hostname(hostname: str) -> str:
     """Trim a PTR name so one long Akamai-style name cannot wrap the report."""
     name = hostname.rstrip(".")
@@ -630,7 +745,8 @@ def _render_socket(socket: SocketState, hostname: str | None = None) -> str:
     """Render one socket line, naming the peer when a name is known."""
     local = _format_endpoint(socket.local_address, socket.local_port)
     if socket.listening:
-        return f"{socket.netid:<4} {socket.state:<10} {local} (listening)"
+        listening = QCoreApplication.translate("ProcessReport", "(listening)")
+        return f"{socket.netid:<4} {socket.state:<10} {local} {listening}"
     peer = _format_endpoint(socket.peer_address, socket.peer_port)
     if hostname:
         peer = f"{peer} ({_short_hostname(hostname)})"
@@ -729,10 +845,16 @@ class DnsResolver(QObject):
             return None
         return hostname
 
-    def request(self, sockets: Iterable[SocketState]) -> None:
-        """Queue a lookup for every unresolved peer among these sockets."""
+    def request(self, sockets: Iterable[SocketState]) -> int:
+        """Queue a lookup for every unresolved peer among these sockets.
+
+        Returns how many lookups were actually started, so a caller can say
+        something true about what pressing a button did: an address that is
+        already cached, already pending, loopback or link-local is skipped.
+        """
         if not self.enabled:
-            return
+            return 0
+        queued = 0
         now = monotonic()
         for socket in sockets:
             address = _bare_address(socket.peer_address)
@@ -743,6 +865,8 @@ class DnsResolver(QObject):
                 continue
             self._pending.add(address)
             self._pool.start(DnsTask(address, self._signals))
+            queued += 1
+        return queued
 
     def shutdown(self) -> None:
         """Drop queued work; lookups already running finish on their own."""
@@ -858,29 +982,56 @@ def describe_logged_instance(record: dict) -> str:
     name = record.get("process_name") or "unknown"
     parent = record.get("parent_command") or ""
     parent_pid = record.get("parent_pid")
-    parent_line = f"{parent_pid}  {parent}".strip() if parent_pid else "(none recorded)"
+    unknown = QCoreApplication.translate("ProcessReport", "unknown")
+    parent_line = (
+        f"{parent_pid}  {parent}".strip()
+        if parent_pid
+        else QCoreApplication.translate("ProcessReport", "(none recorded)")
+    )
     lines = [
-        f"PID {pid} — {name} (logged instance)",
+        QCoreApplication.translate("ProcessReport", "PID {pid} — {name} (logged instance)").format(
+            pid=pid, name=name
+        ),
         "",
-        "This process is no longer running. The record below was captured while it was active.",
+        QCoreApplication.translate(
+            "ProcessReport",
+            "This process is no longer running. The record below was captured while it was active.",
+        ),
         "",
-        "LOGGED INSTANCE",
-        f"  STARTED     {record.get('started_at') or 'unknown'}",
-        f"  FIRST SEEN  {record.get('first_seen') or 'unknown'}",
-        f"  LAST SEEN   {record.get('last_seen') or 'unknown'}",
-        f"  USER        {record.get('user_name') or 'unknown'}",
-        f"  PARENT      {parent_line}",
+        QCoreApplication.translate("ProcessReport", "LOGGED INSTANCE"),
+        QCoreApplication.translate("ProcessReport", "  STARTED     {value}").format(
+            value=record.get("started_at") or unknown
+        ),
+        QCoreApplication.translate("ProcessReport", "  FIRST SEEN  {value}").format(
+            value=record.get("first_seen") or unknown
+        ),
+        QCoreApplication.translate("ProcessReport", "  LAST SEEN   {value}").format(
+            value=record.get("last_seen") or unknown
+        ),
+        QCoreApplication.translate("ProcessReport", "  USER        {value}").format(
+            value=record.get("user_name") or unknown
+        ),
+        QCoreApplication.translate("ProcessReport", "  PARENT      {value}").format(
+            value=parent_line
+        ),
         "",
-        "COMMAND LINE",
-        f"  {record.get('command_line') or '(not recorded)'}",
+        QCoreApplication.translate("ProcessReport", "COMMAND LINE"),
+        f"  {record.get('command_line') or QCoreApplication.translate('ProcessReport', '(not recorded)')}",
     ]
     sockets = record.get("sockets") or []
-    lines.extend(["", "SOCKETS (captured while it was running)"])
+    lines.extend(
+        [
+            "",
+            QCoreApplication.translate(
+                "ProcessReport", "SOCKETS (captured while it was running)"
+            ),
+        ]
+    )
     if sockets:
         for socket in sockets:
             lines.append("  " + _render_socket(_socket_from_row(socket), socket.get("peer_hostname")))
     else:
-        lines.append("  none recorded")
+        lines.append(QCoreApplication.translate("ProcessReport", "  none recorded"))
     return "\n".join(lines)
 
 
@@ -902,6 +1053,9 @@ class ProcessReport:
 
     text: str
     sockets: list[SocketState]
+    # False when the PID could not be described at all, so the caller can fall
+    # back to a stored instance without matching on translated report text.
+    found: bool = True
 
 
 def build_process_report(pid: int, hostnames=None) -> ProcessReport:
@@ -912,20 +1066,33 @@ def build_process_report(pid: int, hostnames=None) -> ProcessReport:
     """
     if pid <= 0:
         return ProcessReport(
-            "PID 0 is not a real process. nethogs reports traffic it could not attribute "
-            "to a process (for example packets that belong to no socket) under PID 0.",
+            QCoreApplication.translate(
+                "ProcessReport",
+                "PID 0 is not a real process. nethogs reports traffic it could not attribute "
+                "to a process (for example packets that belong to no socket) under PID 0.",
+            ),
             [],
+            False,
         )
     info = _ps_process(pid)
     if info is None:
         return ProcessReport(
-            f"No running process with PID {pid}. It may have exited since the last "
-            "table refresh.",
+            QCoreApplication.translate(
+                "ProcessReport",
+                "No running process with PID {pid}. It may have exited since the last "
+                "table refresh.",
+            ).format(pid=pid),
             [],
+            False,
         )
     elapsed = _elapsed_seconds(info)
+    program = info["args"].split()[0] if info["args"] else QCoreApplication.translate(
+        "ProcessReport", "unknown"
+    )
     lines = [
-        f"PID {pid} — {info['args'].split()[0] if info['args'] else 'unknown'}",
+        QCoreApplication.translate("ProcessReport", "PID {pid} — {program}").format(
+            pid=pid, program=program
+        ),
         "",
         f"ps -ww -o {PS_FIELDS} -p {pid}",
         "",
@@ -934,11 +1101,13 @@ def build_process_report(pid: int, hostnames=None) -> ProcessReport:
         f"{_format_elapsed(elapsed):<11} {_started_at(elapsed):<20} "
         f"{info['state']:<5} {info['args']}",
         "",
-        "PARENT CHAIN",
+        QCoreApplication.translate("ProcessReport", "PARENT CHAIN"),
     ]
     ancestors = _parent_chain(pid)
     if not ancestors:
-        lines.append("  (no parent process above PID 1)")
+        lines.append(
+            QCoreApplication.translate("ProcessReport", "  (no parent process above PID 1)")
+        )
     for ancestor in ancestors:
         args = ancestor["args"]
         if len(args) > ANCESTOR_ARGS_LIMIT:
@@ -947,7 +1116,9 @@ def build_process_report(pid: int, hostnames=None) -> ProcessReport:
             f"  {ancestor['pid']:<7} {ancestor['user']:<10} "
             f"{_format_elapsed(_elapsed_seconds(ancestor)):<11} {args}"
         )
-    lines.extend(["", "SOCKETS (ss -tunap, filtered on this PID)"])
+    lines.extend(
+        ["", QCoreApplication.translate("ProcessReport", "SOCKETS (ss -tunap, filtered on this PID)")]
+    )
     sockets = read_process_sockets(pid)
     if sockets:
         for socket in sockets:
@@ -957,10 +1128,13 @@ def build_process_report(pid: int, hostnames=None) -> ProcessReport:
             lines.append(f"  {_render_socket(socket, hostname)}")
     else:
         lines.append(
-            "  none reported (no open sockets, or the process belongs to another user)"
+            QCoreApplication.translate(
+                "ProcessReport",
+                "  none reported (no open sockets, or the process belongs to another user)",
+            )
         )
     if hostnames is None:
-        lines.extend(["", DNS_DISABLED_HINT])
+        lines.extend(["", dns_disabled_hint()])
     return ProcessReport("\n".join(lines), sockets)
 
 
@@ -1006,7 +1180,11 @@ class HistoryChart(QWidget):
         painter.drawRoundedRect(area, 5, 5)
         if len(self._samples) < 2:
             painter.setPen(self._color("text", QPalette.ColorRole.Text))
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "Bandwidth history (last 60 samples)")
+            painter.drawText(
+                area,
+                Qt.AlignmentFlag.AlignCenter,
+                self.tr("Bandwidth history (last 60 samples)"),
+            )
             return
         maximum = max(max(self._samples), 0.1)
         points = []
@@ -1018,8 +1196,198 @@ class HistoryChart(QWidget):
         for start, end in zip(points, points[1:]):
             painter.drawLine(int(start[0]), int(start[1]), int(end[0]), int(end[1]))
         painter.setPen(self._color("text", QPalette.ColorRole.Text))
-        painter.drawText(area.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
-                         f"Peak: {format_rate(maximum)}")
+        painter.drawText(
+            area.adjusted(6, 4, -6, -4),
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+            self.tr("Peak: {}").format(format_rate(maximum)),
+        )
+
+
+class DayUsageChart(QWidget):
+    """Hand-painted chart of one day's sent and received KiB per bucket.
+
+    Samples are keyed by minute of the day, so x is time and not the index of a
+    point: a quiet stretch is drawn on the baseline instead of being compressed
+    away. The rows arrive already aggregated to the chosen granularity, and are
+    expanded back onto that grid so a missing bucket is a zero rather than an
+    interpolated line between two distant points.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(220)
+        self._sent: list[tuple[int, float]] = []
+        self._received: list[tuple[int, float]] = []
+        self._day = ""
+        self._span = (0, MINUTES_PER_DAY)
+        self._granularity = 1
+        self._theme: dict[str, str] = {}
+
+    def set_series(
+        self,
+        sent: list[tuple[int, float]],
+        received: list[tuple[int, float]],
+        day: str,
+        span: tuple[int, int],
+        granularity: int,
+    ) -> None:
+        """Store the buckets and repaint.
+
+        ``sent``/``received`` are ``(minute of day, KiB)`` pairs for buckets
+        that carried traffic, ``span`` is the visible minute window and
+        ``granularity`` the bucket width those minutes were aggregated at.
+        """
+        self._sent = list(sent)
+        self._received = list(received)
+        self._day = day
+        self._granularity = max(1, int(granularity))
+        start, end = int(span[0]), int(span[1])
+        start -= start % self._granularity
+        self._span = (start, max(end, start + self._granularity))
+        self.update()
+
+    def apply_theme(self, theme: dict[str, str]) -> None:
+        """Store the active preset's colours; empty means "use the palette"."""
+        self._theme = dict(theme or {})
+        self.update()
+
+    def _color(self, key: str, role: QPalette.ColorRole) -> QColor:
+        value = self._theme.get(key)
+        return QColor(value) if value else self.palette().color(role)
+
+    def _dense(self, points: list[tuple[int, float]]) -> list[tuple[int, float]]:
+        """One entry per bucket in the span, zero where no sample exists."""
+        lookup = dict(points)
+        start, end = self._span
+        step = self._granularity
+        buckets = []
+        minute = start
+        while minute < end:
+            buckets.append((minute, lookup.get(minute, 0.0)))
+            minute += step
+        return buckets
+
+    def _x(self, minute: int, plot: QRectF) -> float:
+        start, end = self._span
+        return plot.left() + (minute - start) / max(1, end - start) * plot.width()
+
+    def _y(self, value: float, peak: float, plot: QRectF) -> float:
+        return plot.bottom() - min(value, peak) / peak * plot.height()
+
+    def _points(self, series: list[tuple[int, float]], peak: float, plot: QRectF) -> list[QPointF]:
+        return [QPointF(self._x(minute, plot), self._y(value, peak, plot)) for minute, value in series]
+
+    def _paint_axes(self, painter: QPainter, area: QRect, plot: QRectF, peak: float) -> None:
+        grid_pen = QPen(self._color("grid", QPalette.ColorRole.Mid), 1)
+        muted = self._color("text", QPalette.ColorRole.Mid)
+        metrics = painter.fontMetrics()
+        for fraction in (0.0, 0.5, 1.0):
+            y = plot.bottom() - fraction * plot.height()
+            painter.setPen(grid_pen)
+            painter.drawLine(int(plot.left()), int(y), int(plot.right()), int(y))
+            painter.setPen(muted)
+            painter.drawText(
+                QRectF(area.left() + 4, y - 9, 60, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                format_data(peak * fraction),
+            )
+        start, end = self._span
+        span_minutes = end - start
+        step = 60 if span_minutes <= 360 else 180 if span_minutes <= 720 else 360
+        minute = start - start % step
+        while minute <= end:
+            if minute >= start:
+                x = self._x(minute, plot)
+                painter.setPen(grid_pen)
+                painter.drawLine(int(x), int(plot.top()), int(x), int(plot.bottom()))
+                painter.setPen(muted)
+                painter.drawText(
+                    QRectF(x - 24, plot.bottom() + 4, 48, 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"{minute // 60 % 24:02d}:00",
+                )
+            minute += step
+        x = plot.left()
+        y = plot.top() - 14
+        for key, role, label in (
+            ("tx", QPalette.ColorRole.Highlight, self.tr("Sent")),
+            ("rx", QPalette.ColorRole.Text, self.tr("Received")),
+        ):
+            painter.setPen(QPen(self._color(key, role), 2))
+            painter.drawLine(int(x), int(y), int(x) + 16, int(y))
+            painter.setPen(self._color("text", QPalette.ColorRole.Text))
+            painter.drawText(
+                QRectF(x + 22, y - 9, metrics.horizontalAdvance(label) + 8, 18),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+            x += 22 + metrics.horizontalAdvance(label) + 16
+        if self._day:
+            painter.setPen(muted)
+            painter.drawText(
+                QRectF(plot.right() - 180, y - 9, 180, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                self._day,
+            )
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt event naming
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        area = self.rect().adjusted(8, 8, -8, -8)
+        painter.setPen(self._color("grid", QPalette.ColorRole.Mid))
+        painter.drawRoundedRect(area, 5, 5)
+        plot = QRectF(area.left() + 68, area.top() + 26, area.width() - 76, area.height() - 50)
+        if plot.width() < 40 or plot.height() < 30:
+            return
+        sent = self._dense(self._sent)
+        received = self._dense(self._received)
+        peak = max([value for _minute, value in sent + received] + [0.0])
+        self._paint_axes(painter, area, plot, peak)
+        if peak <= 0:
+            painter.setPen(self._color("text", QPalette.ColorRole.Text))
+            painter.drawText(
+                plot, Qt.AlignmentFlag.AlignCenter, self.tr("No traffic in this range.")
+            )
+            return
+        for series, source, key, role in (
+            (sent, self._sent, "tx", QPalette.ColorRole.Highlight),
+            (received, self._received, "rx", QPalette.ColorRole.Text),
+        ):
+            colour = self._color(key, role)
+            if len(source) < 2:
+                # One bucket has no line to draw. A dot at its own point is the
+                # honest mark, and it keeps a one-point series from being
+                # stretched across the full width of the chart.
+                painter.setPen(QPen(colour, 2))
+                painter.setBrush(colour)
+                for minute, value in source:
+                    painter.drawEllipse(
+                        QPointF(self._x(minute, plot), self._y(value, peak, plot)), 3.0, 3.0
+                    )
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                continue
+            points = self._points(series, peak, plot)
+            fill = QPainterPath()
+            fill.moveTo(points[0].x(), plot.bottom())
+            for point in points:
+                fill.lineTo(point)
+            fill.lineTo(points[-1].x(), plot.bottom())
+            fill.closeSubpath()
+            shade = QColor(colour)
+            shade.setAlpha(48)
+            # The fill's top edge is covered by the line drawn over it, so its
+            # own edge smoothing buys nothing and costs raster time.
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(shade)
+            painter.drawPath(fill)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            # A day at one-minute granularity is denser than the pixels it
+            # lands on, so smoothing changes nothing visible but dominates the
+            # paint time; the coarser views keep it because their corners show.
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, len(points) <= 720)
+            painter.setPen(QPen(colour, 2))
+            painter.drawPolyline(points)
 
 
 class ProcessDetailsDialog(QDialog):
@@ -1051,8 +1419,10 @@ class ProcessDetailsDialog(QDialog):
         self._name_timer.timeout.connect(self.reload)
         if resolver is not None:
             resolver.resolved.connect(self._on_hostname)
-        label = f"{name} (PID {pid})" if name else f"PID {pid}"
-        self.setWindowTitle(f"Process details — {label}")
+        label = (
+            self.tr("{} (PID {})").format(name, pid) if name else self.tr("PID {}").format(pid)
+        )
+        self.setWindowTitle(self.tr("Process details — {}").format(label))
         self.resize(900, 560)
         layout = QVBoxLayout(self)
         self.report = QPlainTextEdit()
@@ -1061,14 +1431,14 @@ class ProcessDetailsDialog(QDialog):
         self.report.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         layout.addWidget(self.report, 1)
         buttons = QHBoxLayout()
-        copy_button = QPushButton("Copy")
+        copy_button = QPushButton(self.tr("Copy"))
         copy_button.clicked.connect(self._copy_report)
         buttons.addWidget(copy_button)
-        reload_button = QPushButton("Refresh")
+        reload_button = QPushButton(self.tr("Refresh"))
         reload_button.clicked.connect(self.reload)
         buttons.addWidget(reload_button)
         buttons.addStretch(1)
-        close_button = QPushButton("Close")
+        close_button = QPushButton(self.tr("Close"))
         close_button.clicked.connect(self.accept)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
@@ -1084,7 +1454,7 @@ class ProcessDetailsDialog(QDialog):
             hostnames = self._resolver.lookup
         report = build_process_report(self._pid, hostnames)
         text, sockets = report.text, report.sockets
-        if self._lookup is not None and text.startswith("No running process"):
+        if self._lookup is not None and not report.found:
             record = self._lookup(self._pid)
             if record is not None:
                 text, sockets = describe_logged_instance(record), []
@@ -1152,7 +1522,7 @@ class SettingsDialog(QDialog):
         visible = set(self._settings.visible_lines())
         self._summary_boxes: dict[str, QCheckBox] = {}
         for name in SUMMARY_LINES:
-            box = QCheckBox(SUMMARY_LINE_LABELS[name])
+            box = QCheckBox(summary_line_labels()[name])
             box.setChecked(name in visible)
             self._summary_boxes[name] = box
             layout.addWidget(box)
@@ -1164,17 +1534,17 @@ class SettingsDialog(QDialog):
         form = QFormLayout(page)
         self._rate_units = QComboBox()
         for label, value in (
-            ("Binary — KiB/s, MiB/s", "binary"),
-            ("Decimal — kB/s, MB/s", "decimal"),
-            ("Bits — kbit/s, Mbit/s", "bits"),
+            (self.tr("Binary — KiB/s, MiB/s"), "binary"),
+            (self.tr("Decimal — kB/s, MB/s"), "decimal"),
+            (self.tr("Bits — kbit/s, Mbit/s"), "bits"),
         ):
             self._rate_units.addItem(label, value)
         self._rate_units.setCurrentIndex(max(0, self._rate_units.findData(self._settings.rate_units())))
         form.addRow(self.tr("Rates:"), self._rate_units)
         self._total_units = QComboBox()
         for label, value in (
-            ("Binary — KiB, MiB", "binary"),
-            ("Decimal — kB, MB", "decimal"),
+            (self.tr("Binary — KiB, MiB"), "binary"),
+            (self.tr("Decimal — kB, MB"), "decimal"),
         ):
             self._total_units.addItem(label, value)
         self._total_units.setCurrentIndex(max(0, self._total_units.findData(self._settings.total_units())))
@@ -1192,10 +1562,10 @@ class SettingsDialog(QDialog):
         form = QFormLayout(page)
         self._scheme = QComboBox()
         for label, value in (
-            ("System (desktop colours)", "system"),
-            ("Dark", "dark"),
-            ("Light", "light"),
-            ("High contrast", "contrast"),
+            (self.tr("System (desktop colours)"), "system"),
+            (self.tr("Dark"), "dark"),
+            (self.tr("Light"), "light"),
+            (self.tr("High contrast"), "contrast"),
         ):
             self._scheme.addItem(label, value)
         self._scheme.setCurrentIndex(max(0, self._scheme.findData(self._settings.scheme())))
@@ -1244,8 +1614,9 @@ class SettingsDialog(QDialog):
         self._language.setCurrentIndex(max(0, self._language.findData(current)))
         form.addRow(self.tr("Interface language:"), self._language)
         hint = QLabel(self.tr(
-            "Translation catalogues are scaffolded but not shipped translated yet, so only "
-            "the system default is offered until a catalogue is built."
+            "A language takes effect the next time the app starts. Catalogues are scaffolded "
+            "but not shipped translated yet, so only the system default is offered until "
+            "someone builds one with build-translations.sh."
         ))
         hint.setWordWrap(True)
         form.addRow(hint)
@@ -1263,7 +1634,6 @@ class SettingsDialog(QDialog):
         self._settings.set_dns_ttl_minutes(self._ttl.value())
         self._settings.set_locale(self._language.currentData() or "")
         self.accept()
-
 
 
 def _ensure_usage_schema(connection: sqlite3.Connection) -> None:
@@ -1325,6 +1695,20 @@ def _ensure_usage_schema(connection: sqlite3.Connection) -> None:
                             peer_address, peer_port)
            )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS traffic_samples (
+               day          TEXT    NOT NULL,
+               minute       INTEGER NOT NULL,
+               process_name TEXT    NOT NULL,
+               sent_kib     REAL    NOT NULL DEFAULT 0,
+               received_kib REAL    NOT NULL DEFAULT 0,
+               PRIMARY KEY (day, minute, process_name)
+           )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS traffic_samples_day_process"
+        " ON traffic_samples(day, process_name)"
+    )
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     connection.commit()
 
@@ -1332,7 +1716,7 @@ def _ensure_usage_schema(connection: sqlite3.Connection) -> None:
 class NetworkProcessWindow(QMainWindow):
     def __init__(self, settings: Settings | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("Per-Process Network Monitor")
+        self.setWindowTitle(self.tr("Per-Process Network Monitor"))
         self.resize(950, 680)
         self.settings = settings if settings is not None else Settings()
         app = QApplication.instance()
@@ -1343,6 +1727,12 @@ class NetworkProcessWindow(QMainWindow):
         self._resolver.resolved.connect(self._store_dns_answer)
         self._resolver.load(self._read_dns_cache())
         self._last_accounted_at: datetime | None = None
+        # Minute samples waiting for the rollover. Keyed by day and minute of
+        # the day, then process name, so two pids that happen to share a name
+        # land in the same row, which is what the day-wide sum needs.
+        self._sample_buffer: dict[tuple[str, int], dict[str, list[float]]] = {}
+        self._last_sample_flush: datetime | None = None
+        self._sample_flush_error: str | None = None
         self._available_months: list[str] = []
         self._available_days: tuple[str, list[str]] | None = None
         self._stdout_buffer = b""
@@ -1354,7 +1744,20 @@ class NetworkProcessWindow(QMainWindow):
         self._instance_records: list[dict] = []
         self._instance_tab_index = -1
         self._name_totals_tab_index = -1
+        self._usage_tab_index = -1
+        self._peers_tab_index = -1
+        # The day and its distinct process names the usage filter was filled
+        # from, so the combo is rebuilt only when the selection actually moves.
+        self._usage_filter_state: tuple[str, list[str]] | None = None
         self._last_day_view_at: datetime | None = None
+        # The capture set nethogs was started with, and a guard so the restart
+        # path can stop the child without looking like a user-initiated stop.
+        self._captured_interfaces: tuple[tuple[str, int], ...] = ()
+        self._restarting = False
+        # True between Start and the first parsed line, so the finished handler
+        # can tell "never started" from "ran and stopped" without reading the
+        # status text back, which is translated.
+        self._awaiting_first_output = False
 
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
@@ -1365,28 +1768,28 @@ class NetworkProcessWindow(QMainWindow):
         central = QWidget(self)
         layout = QVBoxLayout(central)
         controls = QHBoxLayout()
-        controls.addWidget(QLabel("Interface:"))
+        controls.addWidget(QLabel(self.tr("Interface:")))
         self.interface_input = QLineEdit()
-        self.interface_input.setPlaceholderText("Default interface (auto-detect)")
+        self.interface_input.setPlaceholderText(self.tr("Default interface (auto-detect)"))
         self.interface_input.setClearButtonEnabled(True)
         controls.addWidget(self.interface_input, 1)
-        self.start_button = QPushButton("Start")
+        self.start_button = QPushButton(self.tr("Start"))
         self.start_button.clicked.connect(self.start_monitoring)
         controls.addWidget(self.start_button)
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton(self.tr("Stop"))
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_monitoring)
         controls.addWidget(self.stop_button)
         layout.addLayout(controls)
 
-        self.status_label = QLabel("Stopped.")
+        self.status_label = QLabel(self.tr("Stopped."))
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-        self.total_label = QLabel("Total: 0.0 KiB/s")
+        self.total_label = QLabel(self.tr("Total: {}").format(format_rate(0.0)))
         self.total_label.setStyleSheet("font-size: 16px; font-weight: 600;")
         layout.addWidget(self.total_label)
-        self.tx_label = QLabel("Total TX: 0.0 KiB/s")
-        self.rx_label = QLabel("Total RX: 0.0 KiB/s")
+        self.tx_label = QLabel(self.tr("Total TX: {}").format(format_rate(0.0)))
+        self.rx_label = QLabel(self.tr("Total RX: {}").format(format_rate(0.0)))
         layout.addWidget(self.tx_label)
         layout.addWidget(self.rx_label)
         self.today_label = QLabel()
@@ -1394,15 +1797,15 @@ class NetworkProcessWindow(QMainWindow):
         layout.addWidget(self.today_label)
 
         history_controls = QHBoxLayout()
-        history_controls.addWidget(QLabel("History month:"))
+        history_controls.addWidget(QLabel(self.tr("History month:")))
         self.month_combo = QComboBox()
         self.month_combo.currentIndexChanged.connect(self._on_history_month_changed)
         history_controls.addWidget(self.month_combo)
-        history_controls.addWidget(QLabel("Day:"))
+        history_controls.addWidget(QLabel(self.tr("Day:")))
         self.day_combo = QComboBox()
         self.day_combo.currentIndexChanged.connect(self._show_selected_day)
         history_controls.addWidget(self.day_combo, 1)
-        self.history_label = QLabel("Select a logged day to view totals.")
+        self.history_label = QLabel(self.tr("Select a logged day to view totals."))
         self.history_label.setWordWrap(True)
         layout.addLayout(history_controls)
         layout.addWidget(self.history_label)
@@ -1412,52 +1815,189 @@ class NetworkProcessWindow(QMainWindow):
         live_layout = QVBoxLayout(live_page)
         self.chart = HistoryChart()
         live_layout.addWidget(self.chart)
-        self.live_table = self._make_table(["Process", "PID", "Sent rate", "Received rate", "Today TX", "Today RX"])
+        self.live_table = self._make_table(
+            [
+                self.tr("Process"),
+                self.tr("PID"),
+                self.tr("Sent rate"),
+                self.tr("Received rate"),
+                self.tr("Today TX"),
+                self.tr("Today RX"),
+            ]
+        )
         self.live_table.cellDoubleClicked.connect(self._show_process_details)
         self.live_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.live_table.customContextMenuRequested.connect(self._live_table_menu)
         self.live_table.itemSelectionChanged.connect(self._update_details_button)
         live_layout.addWidget(self.live_table)
         details_row = QHBoxLayout()
-        self.details_button = QPushButton("Details")
+        self.details_button = QPushButton(self.tr("Details"))
         self.details_button.setEnabled(False)
         self.details_button.clicked.connect(self._show_selected_details)
         details_row.addWidget(self.details_button)
         self.details_hint = QLabel(
-            "Select a row and press Details (or double-click / right-click) for the full "
-            "command line, parent chain and sockets."
+            self.tr(
+                "Select a row and press Details (or double-click / right-click) for the full "
+                "command line, parent chain and sockets."
+            )
         )
         self.details_hint.setWordWrap(True)
         details_row.addWidget(self.details_hint, 1)
         live_layout.addLayout(details_row)
-        self.tabs.addTab(live_page, "Live processes")
+        self.tabs.addTab(live_page, self.tr("Live processes"))
+
+        usage_page = QWidget()
+        usage_layout = QVBoxLayout(usage_page)
+        usage_controls = QHBoxLayout()
+        usage_controls.addWidget(QLabel(self.tr("Range:")))
+        self.usage_range_combo = QComboBox()
+        self.usage_range_combo.addItem(self.tr("Whole day"), None)
+        for hours in USAGE_RANGE_HOURS:
+            self.usage_range_combo.addItem(
+                self.tr("Last {hours} h").format(hours=hours), hours
+            )
+        self.usage_range_combo.currentIndexChanged.connect(self._refresh_usage_tab)
+        usage_controls.addWidget(self.usage_range_combo)
+        usage_controls.addWidget(QLabel(self.tr("Process:")))
+        self.usage_process_combo = QComboBox()
+        self.usage_process_combo.addItem(self.tr("All processes"), None)
+        self.usage_process_combo.currentIndexChanged.connect(self._refresh_usage_tab)
+        usage_controls.addWidget(self.usage_process_combo, 1)
+        usage_controls.addWidget(QLabel(self.tr("Granularity:")))
+        self.usage_granularity_combo = QComboBox()
+        for minutes in USAGE_GRANULARITIES:
+            self.usage_granularity_combo.addItem(
+                self.tr("{minutes} min").format(minutes=minutes), minutes
+            )
+        self.usage_granularity_combo.currentIndexChanged.connect(self._refresh_usage_tab)
+        usage_controls.addWidget(self.usage_granularity_combo)
+        usage_layout.addLayout(usage_controls)
+        self.usage_chart = DayUsageChart()
+        usage_layout.addWidget(self.usage_chart, 1)
+        self.usage_stats_label = QLabel()
+        self.usage_stats_label.setWordWrap(True)
+        usage_layout.addWidget(self.usage_stats_label)
+        self.usage_fallback_label = QLabel()
+        self.usage_fallback_label.setWordWrap(True)
+        self.usage_fallback_label.setVisible(False)
+        usage_layout.addWidget(self.usage_fallback_label)
+        self._usage_tab_index = self.tabs.addTab(usage_page, self.tr("Usage over time"))
+
+        peers_page = QWidget()
+        peers_layout = QVBoxLayout(peers_page)
+        # The caveat sits above the table on purpose: the one wrong reading of
+        # this tab is that a row is a bandwidth figure, and a reader who is
+        # looking for that figure should meet the correction first.
+        self.peers_caveat_label = QLabel(
+            self.tr(
+                "Connection activity, not traffic: bytes are recorded per process per day "
+                "and are not attributed to peers. No column here is a byte count."
+            )
+        )
+        self.peers_caveat_label.setWordWrap(True)
+        peers_layout.addWidget(self.peers_caveat_label)
+        peers_controls = QHBoxLayout()
+        self.peers_running_check = QCheckBox(self.tr("Only running processes"))
+        self.peers_running_check.toggled.connect(self._refresh_peers_tab)
+        peers_controls.addWidget(self.peers_running_check)
+        self.peers_resolve_button = QPushButton(self.tr("Resolve names"))
+        self.peers_resolve_button.clicked.connect(self._resolve_peer_names)
+        peers_controls.addWidget(self.peers_resolve_button)
+        self.peers_status_label = QLabel()
+        self.peers_status_label.setWordWrap(True)
+        peers_controls.addWidget(self.peers_status_label, 1)
+        peers_layout.addLayout(peers_controls)
+        self.peers_table = self._make_table(
+            [
+                self.tr("Peer"),
+                self.tr("Hostname"),
+                self.tr("Port"),
+                self.tr("Protocol"),
+                self.tr("State"),
+                self.tr("Local endpoint"),
+                self.tr("Process"),
+                self.tr("PID"),
+                self.tr("User"),
+                self.tr("Seen"),
+            ]
+        )
+        peers_layout.addWidget(self.peers_table, 1)
+        # Ten columns of real addresses do not fit the window at once, so every
+        # width is set rather than derived. ResizeToContents on a table rebuilt
+        # in place rescans all rows for every setItem: a return visit to this
+        # tab froze the GUI for tens of seconds with a few hundred sockets.
+        # Fixed widths the user can drag keep each rebuild linear. Measured at
+        # 1100 px the whole table fits; narrower windows scroll.
+        peers_header = self.peers_table.horizontalHeader()
+        for column, width in (
+            (0, 200), (1, 125), (2, 80), (3, 90), (4, 100),
+            (5, 125), (6, 125), (7, 80), (8, 120), (9, 160),
+        ):
+            peers_header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            self.peers_table.setColumnWidth(column, width)
+        self.peers_summary_label = QLabel()
+        self.peers_summary_label.setWordWrap(True)
+        peers_layout.addWidget(self.peers_summary_label)
+        self._peers_tab_index = self.tabs.addTab(peers_page, self.tr("Connections / peers"))
+        # Newest first until the user picks a column. The table sorts itself, so
+        # a rebuild keeps whatever order the header indicator shows.
+        self.peers_table.sortByColumn(9, Qt.SortOrder.DescendingOrder)
+        # Answers trickle in one address at a time; coalesce them.
+        self.peer_name_timer = QTimer(self)
+        self.peer_name_timer.setSingleShot(True)
+        self.peer_name_timer.setInterval(PEER_NAME_REFRESH_MS)
+        self.peer_name_timer.timeout.connect(self._refresh_peers_tab)
+        self._resolver.resolved.connect(self._on_peer_name_resolved)
 
         totals_page = QWidget()
         totals_layout = QVBoxLayout(totals_page)
-        self.process_totals_hint = QLabel("Daily totals grouped by process name (all PIDs). Select a day above.")
+        self.process_totals_hint = QLabel(
+            self.tr("Daily totals grouped by process name (all PIDs). Select a day above.")
+        )
         self.process_totals_hint.setWordWrap(True)
         totals_layout.addWidget(self.process_totals_hint)
-        self.name_totals_table = self._make_table(["Process name", "Total TX", "Total RX", "Combined"])
+        self.name_totals_table = self._make_table(
+            [self.tr("Process name"), self.tr("Total TX"), self.tr("Total RX"), self.tr("Combined")]
+        )
         totals_layout.addWidget(self.name_totals_table)
-        self._name_totals_tab_index = self.tabs.addTab(totals_page, "Process name totals")
+        self._name_totals_tab_index = self.tabs.addTab(totals_page, self.tr("Process name totals"))
 
         instances_page = QWidget()
         instances_layout = QVBoxLayout(instances_page)
         self.instances_hint = QLabel(
-            "Logged process instances for the selected day. Double-click a row for the stored "
-            "command line and parent, even after the process has exited."
+            self.tr(
+                "Logged process instances for the selected day. Double-click a row for the stored "
+                "command line and parent, even after the process has exited."
+            )
         )
         self.instances_hint.setWordWrap(True)
         instances_layout.addWidget(self.instances_hint)
         self.instance_table = self._make_table(
-            ["Day", "Started", "PID", "Process", "User", "Parent", "Command"]
+            [
+                self.tr("Day"),
+                self.tr("Started"),
+                self.tr("PID"),
+                self.tr("Process"),
+                self.tr("User"),
+                self.tr("Parent"),
+                self.tr("Command"),
+            ]
         )
         instance_header = self.instance_table.horizontalHeader()
-        instance_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        instance_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.instance_table.setColumnWidth(0, 100)
+        instance_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.instance_table.setColumnWidth(1, 160)
         instance_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.instance_table.cellDoubleClicked.connect(self._show_logged_instance)
         instances_layout.addWidget(self.instance_table)
-        self._instance_tab_index = self.tabs.addTab(instances_page, "Instance history")
+        self._instance_tab_index = self.tabs.addTab(instances_page, self.tr("Instance history"))
+        # The usage query changes at most once a minute and only while its tab
+        # is the visible one, so it has its own slower timer instead of riding
+        # the one-second tick.
+        self.usage_timer = QTimer(self)
+        self.usage_timer.setInterval(USAGE_REFRESH_SECONDS * 1000)
+        self.usage_timer.timeout.connect(self._refresh_usage_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -1470,7 +2010,7 @@ class NetworkProcessWindow(QMainWindow):
             "today": self.today_label,
             "history": self.history_label,
         }
-        self._summary_actions: dict[str, object] = {}
+        self._summary_actions: dict[str, QAction] = {}
         self._build_menus()
         self._apply_settings()
 
@@ -1480,6 +2020,10 @@ class NetworkProcessWindow(QMainWindow):
         self.refresh_timer.setInterval(1000)
         self.refresh_timer.timeout.connect(self._refresh_view)
         self.refresh_timer.start()
+        self.interface_timer = QTimer(self)
+        self.interface_timer.setInterval(INTERFACE_SCAN_SECONDS * 1000)
+        self.interface_timer.timeout.connect(self._check_interfaces)
+        self.interface_timer.start()
         self._update_today_total()
 
     @staticmethod
@@ -1491,8 +2035,13 @@ class NetworkProcessWindow(QMainWindow):
         table.setSortingEnabled(True)
         table.setAlternatingRowColors(True)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Fixed widths, never ResizeToContents: these tables are rebuilt in
+        # place on a timer, and content-sized sections rescan every row on each
+        # setItem, which grows quadratically with row count. Callers override
+        # individual widths where a field needs more room.
         for column in range(1, len(headers)):
-            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            table.setColumnWidth(column, 120)
         return table
 
     def _build_menus(self) -> None:
@@ -1505,7 +2054,7 @@ class NetworkProcessWindow(QMainWindow):
         view_menu = menu.addMenu(self.tr("&View"))
         visible = set(self.settings.visible_lines())
         for name in SUMMARY_LINES:
-            action = view_menu.addAction(SUMMARY_LINE_LABELS[name])
+            action = view_menu.addAction(summary_line_labels()[name])
             action.setCheckable(True)
             action.setChecked(name in visible)
             action.toggled.connect(lambda checked, key=name: self._toggle_summary_line(key, checked))
@@ -1541,6 +2090,7 @@ class NetworkProcessWindow(QMainWindow):
         if app is not None:
             self._theme = apply_color_scheme(app, self.settings.scheme(), self._system_palette)
         self.chart.apply_theme(self._theme)
+        self.usage_chart.apply_theme(self._theme)
         accent = self._theme.get("tx", "")
         self.tx_label.setStyleSheet(f"color: {accent};" if accent else "")
         accent = self._theme.get("rx", "")
@@ -1595,18 +2145,32 @@ class NetworkProcessWindow(QMainWindow):
         cutoff = (datetime.now() - timedelta(days=DNS_CACHE_RETENTION_DAYS)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        # Minute samples are detail, not history: past the retention window the
+        # day keeps its `daily_totals` row and loses the minute rows, so growth
+        # is bounded by a month of detail instead of every byte ever counted.
+        sample_cutoff = (date.today() - timedelta(days=SAMPLE_RETENTION_DAYS)).isoformat()
         with connection:
             connection.execute("DELETE FROM dns_cache WHERE resolved_at < ?", (cutoff,))
+            connection.execute("DELETE FROM traffic_samples WHERE day < ?", (sample_cutoff,))
         return connection
 
     def _record_interval(self, start: datetime, end: datetime, rows: list[ProcessRate]) -> None:
-        """Integrate sampled rates, splitting intervals at local midnight."""
+        """Integrate sampled rates, splitting at local midnight and every minute.
+
+        The minute split exists for `traffic_samples`: a segment that straddled
+        two minutes could not be attributed to either. It reuses the arithmetic
+        that already produces the day total, so a sample is a slice of the same
+        interval rather than a second measurement that could disagree with it.
+        """
         if self._usage_db is None:
             return
         while start < end:
-            segment_end = min(end, datetime.combine(start.date() + timedelta(days=1), time.min))
+            segment_end = min(end, self._segment_end(start))
             seconds = (segment_end - start).total_seconds()
             day = start.date().isoformat()
+            minute = start.hour * 60 + start.minute
+            unattributed_sent = 0.0
+            unattributed_received = 0.0
             with self._usage_db:
                 self._usage_db.execute(
                     """INSERT INTO daily_totals(day, sent_kib, received_kib) VALUES (?, ?, ?)
@@ -1620,6 +2184,15 @@ class NetworkProcessWindow(QMainWindow):
                     sent, received = row.sent_kib_s * seconds, row.received_kib_s * seconds
                     if sent == 0 and received == 0:
                         continue
+                    if row.pid <= 0:
+                        # nethogs could not map the flow to a process. Keeping
+                        # its raw label ("unknown TCP", "1.2.3.4:443-…") stored
+                        # rows for processes that never existed and pushed the
+                        # real ones down the history list; one labelled bucket
+                        # stays visible next to the day total instead.
+                        unattributed_sent += sent
+                        unattributed_received += received
+                        continue
                     self._usage_db.execute(
                         """INSERT INTO process_usage(day, process_name, pid, sent_kib, received_kib)
                            VALUES (?, ?, ?, ?, ?)
@@ -1628,7 +2201,97 @@ class NetworkProcessWindow(QMainWindow):
                                received_kib = received_kib + excluded.received_kib""",
                         (day, row.name, row.pid, sent, received),
                     )
+                if unattributed_sent or unattributed_received:
+                    self._usage_db.execute(
+                        """INSERT INTO process_usage(day, process_name, pid, sent_kib, received_kib)
+                           VALUES (?, ?, 0, ?, ?)
+                           ON CONFLICT(day, process_name, pid) DO UPDATE SET
+                               sent_kib = sent_kib + excluded.sent_kib,
+                               received_kib = received_kib + excluded.received_kib""",
+                        (day, UNATTRIBUTED_PROCESS, unattributed_sent, unattributed_received),
+                    )
+            self._accumulate_sample(day, minute, rows, seconds)
             start = segment_end
+        self._flush_traffic_samples()
+
+    @staticmethod
+    def _segment_end(start: datetime) -> datetime:
+        """The next boundary a segment may not cross: a whole minute or midnight."""
+        midnight = datetime.combine(start.date() + timedelta(days=1), time.min)
+        next_minute = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        return min(midnight, next_minute)
+
+    def _accumulate_sample(
+        self, day: str, minute: int, rows: list[ProcessRate], seconds: float
+    ) -> None:
+        """Add one split's per-process KiB to the minute bucket it belongs to."""
+        bucket = self._sample_buffer.setdefault((day, minute), {})
+        unattributed_sent = 0.0
+        unattributed_received = 0.0
+        for row in rows:
+            sent, received = row.sent_kib_s * seconds, row.received_kib_s * seconds
+            if sent == 0 and received == 0:
+                continue
+            if row.pid <= 0:
+                unattributed_sent += sent
+                unattributed_received += received
+                continue
+            totals = bucket.setdefault(row.name, [0.0, 0.0])
+            totals[0] += sent
+            totals[1] += received
+        if unattributed_sent or unattributed_received:
+            totals = bucket.setdefault(UNATTRIBUTED_PROCESS, [0.0, 0.0])
+            totals[0] += unattributed_sent
+            totals[1] += unattributed_received
+
+    def _flush_traffic_samples(self, force: bool = False) -> None:
+        """Write closed minute buckets to `traffic_samples` in one transaction.
+
+        Called from `_record_interval`, so the flush rides the tick that crosses
+        the minute boundary: at most one write a minute, and never a write in
+        the one-second path. `force` is for the moments the writer is about to
+        go quiet — Stop, window close, or a read of the table — where waiting
+        for the rollover would lose the tail of the current minute.
+        """
+        if self._usage_db is None or not self._sample_buffer:
+            return
+        now = datetime.now()
+        current_minute = (now.date().isoformat(), now.hour * 60 + now.minute)
+        # A bucket is final only once its minute has ended: publishing the
+        # current one would draw a partial minute as a finished point. The
+        # elapsed check is the fallback for a clock that does not advance as
+        # expected, so a buffer can never sit unflushed for longer than a minute.
+        if not force and max(self._sample_buffer) >= current_minute:
+            if (
+                self._last_sample_flush is None
+                or (now - self._last_sample_flush).total_seconds() < SAMPLE_FLUSH_SECONDS
+            ):
+                return
+        payload: list[tuple[str, int, str, float, float]] = []
+        for (day, minute), bucket in sorted(self._sample_buffer.items()):
+            for name, (sent, received) in sorted(bucket.items()):
+                if sent == 0 and received == 0:
+                    continue
+                payload.append((day, minute, name, sent, received))
+        if payload:
+            try:
+                with self._usage_db:
+                    self._usage_db.executemany(
+                        """INSERT INTO traffic_samples(day, minute, process_name, sent_kib, received_kib)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(day, minute, process_name) DO UPDATE SET
+                               sent_kib = sent_kib + excluded.sent_kib,
+                               received_kib = received_kib + excluded.received_kib""",
+                        payload,
+                    )
+                self._sample_flush_error = None
+            except sqlite3.Error as error:
+                # The day totals for this interval are already committed. A
+                # sample failure must not touch them, must not wedge the tick,
+                # and must leave a trace someone can read back.
+                self._sample_flush_error = str(error)
+        self._sample_buffer.clear()
+        self._last_sample_flush = now
 
     def _account_usage(self) -> None:
         if self._usage_db is None:
@@ -1868,15 +2531,30 @@ class NetworkProcessWindow(QMainWindow):
         self.instance_table.setSortingEnabled(True)
         if self._instance_records:
             self.instances_hint.setText(
-                f"{len(self._instance_records)} process instance(s) logged for {logged_day}. "
-                "Double-click a row for the stored command line."
+                self.tr(
+                    "{count} process instance(s) logged for {day}. "
+                    "Double-click a row for the stored command line."
+                ).format(count=len(self._instance_records), day=logged_day)
             )
         else:
-            self.instances_hint.setText(f"No process instances logged for {logged_day} yet.")
+            self.instances_hint.setText(
+                self.tr("No process instances logged for {day} yet.").format(day=logged_day)
+            )
 
     def _on_tab_changed(self, index: int) -> None:
         if index in (self._name_totals_tab_index, self._instance_tab_index):
             self._refresh_selected_day_view()
+        if index == self._usage_tab_index:
+            # A hidden tab issues no query: the timer only runs while the graph
+            # is on screen, and switching to it renders immediately instead of
+            # waiting for the first tick.
+            self.usage_timer.start()
+            self._refresh_usage_tab()
+        else:
+            self.usage_timer.stop()
+        if index == self._peers_tab_index:
+            self._refresh_peers_tab()
+            self.peers_status_label.clear()
 
     def _show_logged_instance(self, row: int, _column: int = 0) -> None:
         item = self.instance_table.item(row, 0)
@@ -1917,7 +2595,12 @@ class NetworkProcessWindow(QMainWindow):
         today = date.today().isoformat()
         sent, received = self._day_totals(today) or (0.0, 0.0)
         self.today_label.setText(
-            f"Today ({today}): TX {format_data(sent)}  RX {format_data(received)}  Total {format_data(sent + received)}"
+            self.tr("Today ({day}): TX {tx}  RX {rx}  Total {total}").format(
+                day=today,
+                tx=format_data(sent),
+                rx=format_data(received),
+                total=format_data(sent + received),
+            )
         )
 
     def _refresh_history_selectors(self) -> bool:
@@ -1976,10 +2659,13 @@ class NetworkProcessWindow(QMainWindow):
         self._available_days = None
         self._refresh_history_selectors()
         self._refresh_selected_day_view()
+        self._usage_filter_state = None
+        self._refresh_usage_tab()
 
     def _show_selected_day(self, _index: int = -1) -> None:
         """Combo signal handler: the user picked a day, so render it now."""
         self._refresh_selected_day_view()
+        self._refresh_usage_tab()
 
     def _day_view_due(self) -> bool:
         """True when the throttled history view is due for a rebuild."""
@@ -1987,26 +2673,52 @@ class NetworkProcessWindow(QMainWindow):
             return True
         return (datetime.now() - self._last_day_view_at).total_seconds() >= DAY_VIEW_REFRESH_SECONDS
 
-    def _refresh_selected_day_view(self) -> None:
-        """Render the selected day: totals line, name totals and instance history."""
-        self._last_day_view_at = datetime.now()
+    def _update_selected_day_total(self) -> None:
+        """Render the selected day's total line.
+
+        This is one indexed row read, so it runs on every tick: the line under
+        `History month:` must describe the same row as the `Today` line at the
+        same moment, or the two disagree for as long as the slower cadence lags.
+        Only the two tables behind it are throttled.
+        """
         if self._usage_db is None:
             return
         logged_day = self.day_combo.currentData()
         if not logged_day:
-            self.history_label.setText("No monitoring logs for this month yet.")
-            self.name_totals_table.setRowCount(0)
-            self._refresh_instance_history()
+            self.history_label.setText(self.tr("No monitoring logs for this month yet."))
             return
         totals = self._day_totals(logged_day)
-        suffix = " (today)" if logged_day == date.today().isoformat() else ""
+        suffix = (
+            self.tr(" (today)") if logged_day == date.today().isoformat() else ""
+        )
         if totals is None:
-            self.history_label.setText(f"No totals recorded for {logged_day}.")
+            self.history_label.setText(
+                self.tr("No totals recorded for {day}.").format(day=logged_day)
+            )
         else:
             sent, received = totals
             self.history_label.setText(
-                f"{logged_day}{suffix}: TX {format_data(sent)}  RX {format_data(received)}  Total {format_data(sent + received)}"
+                self.tr("{day}{suffix}: TX {tx}  RX {rx}  Total {total}").format(
+                    day=logged_day,
+                    suffix=suffix,
+                    tx=format_data(sent),
+                    rx=format_data(received),
+                    total=format_data(sent + received),
+                )
             )
+
+    def _refresh_selected_day_view(self, update_total: bool = True) -> None:
+        """Render the selected day: totals line, name totals and instance history."""
+        self._last_day_view_at = datetime.now()
+        if self._usage_db is None:
+            return
+        if update_total:
+            self._update_selected_day_total()
+        logged_day = self.day_combo.currentData()
+        if not logged_day:
+            self.name_totals_table.setRowCount(0)
+            self._refresh_instance_history()
+            return
         # Group by executable/process name, deliberately combining all PIDs so
         # a relaunch of the same program contributes to the same daily total.
         grouped = self._usage_db.execute(
@@ -2028,12 +2740,374 @@ class NetworkProcessWindow(QMainWindow):
                     self.name_totals_table.item(index, column).setData(Qt.ItemDataRole.UserRole, value)
         self.name_totals_table.setSortingEnabled(True)
         if not grouped:
-            self.process_totals_hint.setText(f"No per-process traffic recorded for {logged_day}.")
+            self.process_totals_hint.setText(
+                self.tr("No per-process traffic recorded for {day}.").format(day=logged_day)
+            )
         else:
             self.process_totals_hint.setText(
-                f"Daily totals for {logged_day}, grouped by process name and combining all PIDs."
+                self.tr(
+                    "Daily totals for {day}, grouped by process name and combining all PIDs."
+                ).format(day=logged_day)
             )
         self._refresh_instance_history()
+
+    def _first_sample_day(self) -> str | None:
+        """The earliest day that still has minute rows, or None if there are none."""
+        if self._usage_db is None:
+            return None
+        row = self._usage_db.execute("SELECT MIN(day) FROM traffic_samples").fetchone()
+        return row[0] if row and row[0] else None
+
+    def _first_sample_minute(self, day: str) -> int | None:
+        """The earliest minute of one day that has a sample, or None."""
+        if self._usage_db is None:
+            return None
+        row = self._usage_db.execute(
+            "SELECT MIN(minute) FROM traffic_samples WHERE day = ?", (day,)
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def _usage_window(self, day: str) -> tuple[int, int]:
+        """The visible minute window for the selected day and range preset.
+
+        A past day has no "last hour" to show, so its presets collapse to the
+        whole day. On today the preset is clamped to the samples that exist:
+        starting an hour before the first sample would only pad the left edge
+        with a flat line.
+        """
+        hours = self.usage_range_combo.currentData()
+        if day != date.today().isoformat() or not hours:
+            return (0, MINUTES_PER_DAY)
+        now = datetime.now()
+        end = now.hour * 60 + now.minute + 1  # include the minute in progress
+        start = max(0, end - int(hours) * 60)
+        first = self._first_sample_minute(day)
+        if first is not None and first > start:
+            start = first
+        if end <= start:
+            end = start + 1
+        return (start, end)
+
+    def _sample_series(
+        self, day: str, process_name: str | None, granularity: int
+    ) -> list[tuple[int, float, float]]:
+        """One row per bucket: (bucket minute, sent KiB, received KiB).
+
+        The minute is floored in SQL, so 1/5/15/60-minute views of the same
+        range sum the same rows and differ only in how many buckets they carry.
+        """
+        if self._usage_db is None:
+            return []
+        bucket = max(1, int(granularity))
+        query = """SELECT (minute / ?) * ? AS bucket, SUM(sent_kib), SUM(received_kib)
+                   FROM traffic_samples WHERE day = ?"""
+        params: list = [bucket, bucket, day]
+        if process_name is not None:
+            query += " AND process_name = ?"
+            params.append(process_name)
+        query += " GROUP BY bucket ORDER BY bucket"
+        rows = self._usage_db.execute(query, params).fetchall()
+        return [(int(minute), float(sent), float(received)) for minute, sent, received in rows]
+
+    def _fill_usage_process_filter(self, day: str) -> None:
+        """Rebuild the process filter when the selected day's names change."""
+        if self._usage_db is None:
+            return
+        names = [
+            row[0]
+            for row in self._usage_db.execute(
+                """SELECT DISTINCT process_name FROM traffic_samples WHERE day = ?
+                   ORDER BY process_name COLLATE NOCASE""",
+                (day,),
+            )
+        ]
+        if self._usage_filter_state == (day, names):
+            return
+        previous = self.usage_process_combo.currentData()
+        self._usage_filter_state = (day, names)
+        self.usage_process_combo.blockSignals(True)
+        self.usage_process_combo.clear()
+        self.usage_process_combo.addItem(self.tr("All processes"), None)
+        for name in names:
+            self.usage_process_combo.addItem(name, name)
+        index = self.usage_process_combo.findData(previous)
+        self.usage_process_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.usage_process_combo.blockSignals(False)
+
+    def _show_usage_fallback(self, day: str) -> None:
+        """Explain a day with no minute rows instead of drawing an empty chart.
+
+        Detail older than the retention window is pruned on purpose; the day
+        total survives it, so the tab falls back to that number and says where
+        minute detail begins rather than pretending nothing was recorded.
+        """
+        totals = self._day_totals(day)
+        if totals is None:
+            day_text = self.tr("No totals recorded for {day}.").format(day=day)
+        else:
+            sent, received = totals
+            day_text = self.tr(
+                "{day}: TX {tx}  RX {rx}  Total {total} (day totals only)"
+            ).format(
+                day=day,
+                tx=format_data(sent),
+                rx=format_data(received),
+                total=format_data(sent + received),
+            )
+        first = self._first_sample_day()
+        if first is None:
+            detail = self.tr("No minute samples have been recorded yet.")
+        else:
+            detail = self.tr("Minute detail starts on {day}.").format(day=first)
+        self.usage_fallback_label.setText(f"{day_text} {detail}")
+        self.usage_fallback_label.setVisible(True)
+
+    def _refresh_usage_tab(self, *_args) -> None:
+        """Flush, query and redraw the usage tab. Runs only while it is visible."""
+        if self._usage_db is None or self.tabs.currentIndex() != self._usage_tab_index:
+            return
+        # A read is exactly the moment the open minute must not stay unwritten:
+        # the graph should include it, and there is no later tick that will.
+        self._flush_traffic_samples(force=True)
+        day = self.day_combo.currentData()
+        if not day:
+            self.usage_chart.set_series([], [], "", (0, MINUTES_PER_DAY), 1)
+            self.usage_stats_label.clear()
+            self.usage_fallback_label.setText(
+                self.tr("No monitoring logs for this month yet.")
+            )
+            self.usage_fallback_label.setVisible(True)
+            return
+        today = date.today().isoformat()
+        whole_day_index = self.usage_range_combo.findData(None)
+        if day != today and self.usage_range_combo.currentIndex() != whole_day_index:
+            # Collapse a stale preset before the window is computed: a past day
+            # has no live hour, and leaving "Last 1 h" selected would be a lie.
+            self.usage_range_combo.blockSignals(True)
+            self.usage_range_combo.setCurrentIndex(whole_day_index)
+            self.usage_range_combo.blockSignals(False)
+        self.usage_range_combo.setEnabled(day == today)
+        self._fill_usage_process_filter(day)
+        span = self._usage_window(day)
+        granularity = int(self.usage_granularity_combo.currentData() or 1)
+        # Snap the window to the bucket grid so a bucket is either wholly in the
+        # view or out of it, and a floor-rounded bucket label is never dropped at
+        # the left edge after its minutes had already been summed into it.
+        span = (span[0] - span[0] % granularity, span[1])
+        # The window is applied here rather than in SQL so the query stays one
+        # statement that the range preset does not have to be threaded through.
+        rows = [
+            row
+            for row in self._sample_series(
+                day, self.usage_process_combo.currentData(), granularity
+            )
+            if span[0] <= row[0] < span[1]
+        ]
+        if not rows:
+            self.usage_chart.set_series([], [], day, span, granularity)
+            self.usage_stats_label.clear()
+            self._show_usage_fallback(day)
+            return
+        self.usage_fallback_label.setVisible(False)
+        sent = [(minute, sent_kib) for minute, sent_kib, _received in rows]
+        received = [(minute, received_kib) for minute, _sent, received_kib in rows]
+        self.usage_chart.set_series(sent, received, day, span, granularity)
+        total_sent = sum(value for _minute, value in sent)
+        total_received = sum(value for _minute, value in received)
+        busiest = max(rows, key=lambda row: row[1] + row[2])
+        busiest_time = f"{busiest[0] // 60:02d}:{busiest[0] % 60:02d}"
+        if granularity == 1:
+            busiest_label = self.tr("busiest minute")
+        else:
+            busiest_label = self.tr("busiest {minutes} min bucket").format(minutes=granularity)
+        self.usage_stats_label.setText(
+            self.tr(
+                "{day}: sent {sent}  received {received} — {busiest} at {time} with {total}"
+            ).format(
+                day=day,
+                sent=format_data(total_sent),
+                received=format_data(total_received),
+                busiest=busiest_label,
+                time=busiest_time,
+                total=format_data(busiest[1] + busiest[2]),
+            )
+        )
+
+    def _peers_query(self) -> list[dict]:
+        """One dict per stored socket, with its owner and any cached peer name.
+
+        ``process_sockets`` is the snapshot set: the capture replaces it per
+        instance, so a row is what was true when the socket table was last read,
+        not a live connection. ``dns_cache`` is keyed by the bare address while a
+        stored peer may carry an IPv6 scope zone, so the join strips the zone the
+        same way the resolver does. A socket whose instance row is missing keeps
+        empty owner fields instead of disappearing.
+        """
+        if self._usage_db is None:
+            return []
+        rows = self._usage_db.execute(
+            """SELECT s.peer_address, s.peer_port, s.netid, s.state,
+                      s.local_address, s.local_port,
+                      COALESCE(c.hostname, s.peer_hostname),
+                      COALESCE(i.process_name, ''), s.pid, COALESCE(i.user_name, ''),
+                      s.started_at, COALESCE(i.last_seen, ''), s.captured_at
+               FROM process_sockets AS s
+               LEFT JOIN process_instances AS i
+                      ON i.pid = s.pid AND i.started_at = s.started_at
+               LEFT JOIN dns_cache AS c
+                      ON c.address = CASE
+                           WHEN instr(s.peer_address, '%') > 0
+                           THEN substr(s.peer_address, 1, instr(s.peer_address, '%') - 1)
+                           ELSE s.peer_address END"""
+        ).fetchall()
+        return [dict(zip(PEER_FIELDS, row)) for row in rows]
+
+    @staticmethod
+    def _peer_is_listening(row: dict) -> bool:
+        return row["peer_port"] in ("", "*")
+
+    def _visible_peer_rows(self) -> tuple[list[dict], list[dict]]:
+        """(all stored rows, the rows the current filter keeps)."""
+        rows = self._peers_query()
+        if not self.peers_running_check.isChecked():
+            return rows, rows
+        tracked = {
+            (instance.pid, instance.started_at)
+            for instance in self._tracked_instances.values()
+        }
+        return rows, [
+            row for row in rows if (row["pid"], row["started_at"]) in tracked
+        ]
+
+    def _refresh_peers_tab(self, *_args) -> None:
+        """Rebuild the peers table from the stored sockets, while it is visible."""
+        if self._usage_db is None or self.tabs.currentIndex() != self._peers_tab_index:
+            return
+        all_rows, rows = self._visible_peer_rows()
+        self.peers_table.setSortingEnabled(False)
+        self.peers_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            port = QTableWidgetItem(row["peer_port"])
+            if row["peer_port"].isdigit():
+                port.setData(Qt.ItemDataRole.UserRole, float(row["peer_port"]))
+            pid = NumericTableWidgetItem(str(row["pid"]))
+            pid.setData(Qt.ItemDataRole.UserRole, float(row["pid"]))
+            seen = QTableWidgetItem(row["last_seen"])
+            # The table says when the process was last seen. The socket itself
+            # was read at this moment, which can be a little earlier.
+            seen.setToolTip(
+                self.tr("Sockets captured at {time}").format(time=row["captured_at"])
+            )
+            peer = QTableWidgetItem(
+                _format_endpoint(row["peer_address"], row["peer_port"])
+            )
+            # A long IPv6 endpoint is elided in the column, so the cell keeps
+            # the whole thing where a reader can still get it.
+            peer.setToolTip(peer.text())
+            cells = (
+                peer,
+                QTableWidgetItem(row["hostname"] or ""),
+                port,
+                QTableWidgetItem(row["netid"]),
+                QTableWidgetItem(row["state"]),
+                QTableWidgetItem(
+                    _format_endpoint(row["local_address"], row["local_port"])
+                ),
+                QTableWidgetItem(row["process_name"]),
+                pid,
+                QTableWidgetItem(row["user_name"]),
+                seen,
+            )
+            for column, cell in enumerate(cells):
+                self.peers_table.setItem(index, column, cell)
+        self.peers_table.setSortingEnabled(True)
+        connections = len(rows)
+        peers = {
+            row["peer_address"] for row in rows if not self._peer_is_listening(row)
+        }
+        processes = {(row["pid"], row["started_at"]) for row in rows}
+        unresolved = sum(
+            1
+            for row in rows
+            if not row["hostname"] and not self._peer_is_listening(row)
+        )
+        if connections:
+            if self.peers_running_check.isChecked():
+                template = self.tr(
+                    "Showing {shown} of {stored} stored connection(s) from processes "
+                    "still tracked: {peers} distinct peer(s), {processes} process(es), "
+                    "{unresolved} without a name."
+                )
+                summary = template.format(
+                    shown=connections,
+                    stored=len(all_rows),
+                    peers=len(peers),
+                    processes=len(processes),
+                    unresolved=unresolved,
+                )
+            else:
+                template = self.tr(
+                    "{connections} stored connection(s) to {peers} distinct peer(s) "
+                    "from {processes} process(es); {unresolved} without a name."
+                )
+                summary = template.format(
+                    connections=connections,
+                    peers=len(peers),
+                    processes=len(processes),
+                    unresolved=unresolved,
+                )
+        elif all_rows:
+            summary = self.tr(
+                "No stored socket belongs to a process that is still tracked. Clear "
+                "Only running processes to see all {stored} stored connection(s)."
+            ).format(stored=len(all_rows))
+        else:
+            summary = self.tr(
+                "No stored socket snapshots yet. Start monitoring to capture connection "
+                "activity."
+            )
+        self.peers_summary_label.setText(summary)
+
+    def _resolve_peer_names(self) -> None:
+        """Queue name lookups for the unresolved peers on the visible rows."""
+        all_rows, rows = self._visible_peer_rows()
+        if not self._resolver.enabled:
+            self.peers_status_label.setText(dns_disabled_hint())
+            return
+        sockets = [
+            SocketState(
+                row["netid"],
+                row["state"],
+                row["local_address"],
+                row["local_port"],
+                row["peer_address"],
+                row["peer_port"],
+            )
+            for row in rows
+            if not row["hostname"] and not self._peer_is_listening(row)
+        ]
+        queued = self._resolver.request(sockets)
+        if queued:
+            self.peers_status_label.setText(
+                self.tr(
+                    "{count} name lookup(s) queued; names appear as the answers arrive."
+                ).format(count=queued)
+            )
+        elif rows:
+            self.peers_status_label.setText(
+                self.tr(
+                    "No lookup was queued: every peer here is already named or cached, "
+                    "or is a loopback, link-local, unspecified or listening address."
+                )
+            )
+        else:
+            self.peers_status_label.setText(
+                self.tr("No stored socket to resolve on this tab.")
+            )
+
+    def _on_peer_name_resolved(self, _address: str, _hostname: str) -> None:
+        """One name arrived; rebuild the table once the burst is over."""
+        self.peer_name_timer.start()
 
     def start_monitoring(self) -> None:
         if self.process.state() != QProcess.ProcessState.NotRunning:
@@ -2041,17 +3115,21 @@ class NetworkProcessWindow(QMainWindow):
         nethogs = shutil.which("nethogs")
         if not nethogs:
             QMessageBox.warning(
-                self, "Missing dependency", "Install nethogs before starting the monitor."
+                self,
+                self.tr("Missing dependency"),
+                self.tr("Install nethogs before starting the monitor."),
             )
             return
         missing = missing_nethogs_capabilities(os.path.realpath(nethogs))
         if missing:
             QMessageBox.warning(
                 self,
-                "nethogs cannot capture packets",
-                "{} is missing {}.\n\nGrant them once with:\n\nsudo setcap {}=ep {}\n\n"
-                "A nethogs package upgrade replaces the binary and drops them again, so "
-                "re-apply this after upgrading.".format(
+                self.tr("nethogs cannot capture packets"),
+                self.tr(
+                    "{} is missing {}.\n\nGrant them once with:\n\nsudo setcap {}=ep {}\n\n"
+                    "A nethogs package upgrade replaces the binary and drops them again, so "
+                    "re-apply this after upgrading."
+                ).format(
                     nethogs,
                     ", ".join(missing),
                     ",".join(name for name, _bit in NETHOGS_CAPABILITIES),
@@ -2059,11 +3137,12 @@ class NetworkProcessWindow(QMainWindow):
                 ),
             )
             return
-        arguments = ["-t", "-d", "1", "-c", "0"]
+        arguments = self._nethogs_arguments()
         interface = self.interface_input.text().strip()
         self.settings.set_interface(interface)
-        if interface:
-            arguments.append(interface)
+        # Remembered so a later comparison can tell whether the devices nethogs
+        # bound to are still the devices that carry traffic.
+        self._captured_interfaces = capture_interfaces()
         self._stdout_buffer = b""
         self._in_refresh_cycle = False
         self._pending_rows.clear()
@@ -2074,15 +3153,101 @@ class NetworkProcessWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.interface_input.setEnabled(False)
-        self.status_label.setText("Starting nethogs…")
+        self._awaiting_first_output = True
+        self.status_label.setText(self.tr("Starting nethogs…"))
+
+    def _nethogs_arguments(self) -> list[str]:
+        """The nethogs command line: text mode, one-second refresh, no count.
+
+        No device argument means "every device", which is evaluated by nethogs
+        when it starts. A name typed into the interface field pins one device.
+        """
+        arguments = ["-t", "-d", "1", "-c", "0"]
+        interface = self.interface_input.text().strip()
+        if interface:
+            arguments.append(interface)
+        return arguments
+
+    def _check_interfaces(self) -> None:
+        """Restart nethogs when the set of capture devices has changed.
+
+        nethogs opens its capture handles once and never follows a device that
+        appears later, so a tunnel that comes up after the monitor started is
+        invisible: the VPN reconnects, every tunnelled process reads zero, and
+        nothing explains the silence. Restarting the child re-binds the current
+        devices through the same teardown path a user Stop takes.
+        """
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        current = capture_interfaces()
+        if not current:
+            return
+        pinned = self.interface_input.text().strip()
+        if pinned:
+            # A pinned device is the user's choice, but it can still be torn
+            # down and recreated under the same name, which leaves the same
+            # dead handle. Only its identity is worth comparing then.
+            previous = tuple(pair for pair in self._captured_interfaces if pair[0] == pinned)
+            current = tuple(pair for pair in current if pair[0] == pinned)
+            if not current:
+                return
+        else:
+            previous = self._captured_interfaces
+        if current == previous:
+            return
+        self._captured_interfaces = capture_interfaces()
+        added = sorted({name for name, _index in current} - {name for name, _index in previous})
+        removed = sorted({name for name, _index in previous} - {name for name, _index in current})
+        if not added and not removed:
+            reason = f"{pinned} was recreated"
+        else:
+            reason = "; ".join(
+                part for part in (
+                    "added " + ", ".join(added) if added else "",
+                    "removed " + ", ".join(removed) if removed else "",
+                ) if part
+            )
+        self._restart_nethogs(reason)
+
+    def _restart_nethogs(self, reason: str) -> None:
+        """Replace the capture child without losing the interval it covered."""
+        nethogs = shutil.which("nethogs")
+        if not nethogs:
+            return
+        # Account for the interval with the rates still displayed, then drop
+        # them: carrying stale rates into the new capture would re-count them.
+        self._account_usage()
+        self._restarting = True
+        try:
+            if self.process.state() != QProcess.ProcessState.NotRunning:
+                self.process.terminate()
+                if not self.process.waitForFinished(1500):
+                    self.process.kill()
+                    self.process.waitForFinished(1000)
+        finally:
+            self._restarting = False
+        self._stdout_buffer = b""
+        self._in_refresh_cycle = False
+        self._pending_rows.clear()
+        self._rows.clear()
+        self.live_table.setRowCount(0)
+        self._last_accounted_at = datetime.now()
+        self.process.start(nethogs, self._nethogs_arguments())
+        self.status_label.setText(
+            self.tr("Monitoring. Capture restarted ({reason}).").format(reason=reason)
+        )
 
     def stop_monitoring(self) -> None:
+        self._captured_interfaces = ()
+
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.terminate()
             if not self.process.waitForFinished(1500):
                 self.process.kill()
                 self.process.waitForFinished(1000)
         self._account_usage()
+        # The current minute is not over, but nothing will write it after this.
+        self._flush_traffic_samples(force=True)
         self._last_accounted_at = None
         self._commit_pending_rows()
         self._refresh_view()
@@ -2103,8 +3268,9 @@ class NetworkProcessWindow(QMainWindow):
             rate = parse_nethogs_line(line)
             if rate is None:
                 continue
-            if self.status_label.text().startswith("Starting"):
-                self.status_label.setText("Monitoring.")
+            if self._awaiting_first_output:
+                self._awaiting_first_output = False
+                self.status_label.setText(self.tr("Monitoring."))
             key = (rate.pid, rate.name)
             if self._in_refresh_cycle:
                 self._pending_rows[key] = rate
@@ -2126,16 +3292,27 @@ class NetworkProcessWindow(QMainWindow):
         total_sent = sum(row.sent_kib_s for row in ordered)
         total_received = sum(row.received_kib_s for row in ordered)
         total = total_sent + total_received
-        self.total_label.setText(f"Total: {format_rate(total)}")
-        self.tx_label.setText(f"Total TX: {format_rate(total_sent)}")
-        self.rx_label.setText(f"Total RX: {format_rate(total_received)}")
+        self.total_label.setText(self.tr("Total: {}").format(format_rate(total)))
+        self.tx_label.setText(self.tr("Total TX: {}").format(format_rate(total_sent)))
+        self.rx_label.setText(self.tr("Total RX: {}").format(format_rate(total_received)))
         self.chart.set_sample(total)
         self._update_today_total()
         # Selectors are rebuilt only when the logged days change; the selected
-        # day's view is re-rendered on a slower cadence so a running transfer
-        # still moves the day total without rebuilding two tables every second.
-        if self._refresh_history_selectors() or self._day_view_due():
-            self._refresh_selected_day_view()
+        # day's total line is one row read and follows every tick, while the two
+        # tables behind it are re-rendered on a slower cadence so a running
+        # transfer still moves the day total without rebuilding them every second.
+        rebuilt = self._refresh_history_selectors()
+        self._update_selected_day_total()
+        if rebuilt or self._day_view_due():
+            self._refresh_selected_day_view(update_total=False)
+            # The peers table is a snapshot read of the same slow-changing data,
+            # so it rides this cadence and not the one-second tick. While its
+            # tab is hidden the call returns before issuing a query.
+            self._refresh_peers_tab()
+        if rebuilt:
+            # The day list moved under the selection (midnight rollover or a new
+            # month), so the graph follows it. Happens once a day, not per tick.
+            self._refresh_usage_tab()
         self._log_process_instances(ordered)
         self._flush_last_seen()
         selected_pid = self._selected_pid()
@@ -2175,7 +3352,7 @@ class NetworkProcessWindow(QMainWindow):
         if pid is None:
             return
         menu = QMenu(self)
-        action = menu.addAction("Process details…")
+        action = menu.addAction(self.tr("Process details…"))
         action.triggered.connect(lambda: self._open_process_details(pid, name))
         menu.exec(self.live_table.viewport().mapToGlobal(position))
 
@@ -2215,7 +3392,12 @@ class NetworkProcessWindow(QMainWindow):
         ).exec()
 
     def _process_finished(self, _exit_code: int, _exit_status) -> None:
+        if self._restarting:
+            # This exit is our own capture restart; a replacement child is about
+            # to start, so the window must not report a stop.
+            return
         self._account_usage()
+        self._flush_traffic_samples(force=True)
         self._last_accounted_at = None
         self._commit_pending_rows()
         self._refresh_view()
@@ -2223,17 +3405,22 @@ class NetworkProcessWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.interface_input.setEnabled(True)
-        if self.status_label.text().startswith("Starting"):
-            self.status_label.setText("Monitor stopped before producing output.")
+        if self._awaiting_first_output:
+            self._awaiting_first_output = False
+            self.status_label.setText(self.tr("Monitor stopped before producing output."))
         elif self._rows:
-            self.status_label.setText("Stopped.")
+            self.status_label.setText(self.tr("Stopped."))
         else:
-            self.status_label.setText("Stopped — no process data received.")
+            self.status_label.setText(self.tr("Stopped — no process data received."))
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.ProcessError.FailedToStart:
             self._last_accounted_at = None
-            self.status_label.setText(f"Could not start monitor: {self.process.errorString()}")
+            self.status_label.setText(
+                self.tr("Could not start monitor: {error}").format(
+                    error=self.process.errorString()
+                )
+            )
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.interface_input.setEnabled(True)
@@ -2246,6 +3433,9 @@ class NetworkProcessWindow(QMainWindow):
                 self.process.kill()
                 self.process.waitForFinished(500)
             self._account_usage()
+        # Closing the window is the last chance to write the open minute; the
+        # buffer must be drained before the connection is closed below.
+        self._flush_traffic_samples(force=True)
         self._last_accounted_at = None
         self._flush_last_seen(force=True)
         self._resolver.shutdown()

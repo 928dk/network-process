@@ -24,6 +24,9 @@ AGENTS.md.*
 project_analysis_*.json
 quick-project-analysis-*.md
 
+# Translation catalogues: the .ts sources are tracked, the built .qm are not
+translations/*.qm
+
 # --- added by publish-sanitize ---
 venv/
 .venv/
